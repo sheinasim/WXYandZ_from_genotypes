@@ -1,0 +1,226 @@
+---
+title: "Identify X or Z Chromosomes from genotype data"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+---
+
+```{r setup, include = F} 
+library(tidyverse)
+library(plyr)
+library(broom)
+library(dplyr)
+library(ggplot2)
+
+data_summary <- function(data, varname, groupnames){
+  require(plyr)
+  summary_func <- function(x, col){
+    c(mean = mean(x[[col]], na.rm=TRUE),
+      sem = sd(x[[col]], na.rm=TRUE)/sqrt(length(x[[col]])))
+  }
+  data_sum<-ddply(data, groupnames, .fun=summary_func,
+                  varname)
+  data_sum <- rename(data_sum, c("mean" = varname))
+ return(data_sum)
+}
+```
+
+Required: 
+
+* .vcf 
+* vcftools in path
+* sex of individuals in your dataset (tab delimited)
+
+Make list of chromosomes/scaffolds/contigs found in your .vcf
+
+Take care not to have problematic characters such as '|' in your scaffold names
+
+The following is the code to run the vcftools --geno-depth and vcftools --het analyses in a shell script or can be submitted to a job scheduler with the proper header.
+
+This will result in an output directory containing a file with the read depth of every locus for every individual (.gdepth) and observed and expected homozygosities, number of loci, and inbreeding coefficient (F) for each individual for each scaffold separately. Following vcftools, this script will concatenate all .het outputs and append scaffold information to produce a file all homozygosity values in a tab delimited format (.tsv).
+
+
+```{r, engine = 'bash', eval = F}
+species=yourspecies
+vcfile=yourgenotypes.vcf
+chrfile=yourchr.txt
+outdir=Homozygosities
+homozygositiesfile=allhomozygosities.tsv
+
+if [ ! -d "$outdir" ]; then
+    mkdir $outdir
+fi
+
+cat $vcfile | grep -v "^#" | awk '{print $1}' | sort -u >$chrfile
+
+for x in `cat $chrfile`
+do
+vcftools --vcf $vcfile --het --chr $x --out $outdir/$x 
+done
+
+for x in `cat $chrfile`
+do
+cat $outdir/$x.het | awk -F '\t' -v i=$x -v OFS='\t' '{print 'i', $0}' | grep -v "O(HOM)" >>$homozygositiesfile
+done
+
+sed -i '1iScaffold\tIndv\tO.hom)\tE.hom)\tN\tF' $homozygositiesfile
+vcftools --vcf $vcfile --geno-depth --out $yourspecies
+```
+Required libraries and function loaded by setup:
+
+* tidyverse
+* plyr
+* broom
+* dplyr
+* ggplot2
+* data_summary()
+
+
+Below are R scripts to read in the locus depth file and heterozygosities file from above and a file you produce which contains the individual name (matching exactly with the individual name in the .vcf) and sex and appends sex information for all individuals to the augmented vcftools .het output. 
+
+The data frames are wrangled to create necessary data columns for analyses.
+
+```{r Read&Wrangle, message = F}
+sexes <- read_tsv("indv_sex.tsv", col_names=T)
+heterozygosities <- read_tsv("allhomozygosities.tsv", col_names=T) %>% 
+  filter(N > 100) %>%
+  inner_join(sexes) %>% 
+  mutate(O.het =  N - O.hom) %>% 
+  mutate(E.het = N - E.hom) %>%
+  mutate(PE.het = E.het/N) %>% 
+  mutate(PO.het = O.het/N) %>% 
+  dplyr::select(Scaffold, Sex, PO.het)
+
+depth <- read_tsv("yourspecies.gdepth", col_names=T) 
+
+depth <- depth %>% 
+  gather(Indv, G.depth, 3:ncol(depth)) %>% 
+  inner_join(sexes) %>% 
+  mutate(G.depth=replace(G.depth, G.depth==-1, 0)) %>% 
+  dplyr::select(Scaffold=CHROM, Position=POS, Depth=G.depth, Indv, Sex) %>% 
+  unite("Locus", Scaffold:Position, sep = "_")
+```
+
+Below is a way to run a two-sample T test comparing the proportion of observed heterozygosities of females and males.
+
+```{r message = F}
+df_XY <- data_summary(heterozygosities, varname = "PO.het", groupnames = c("Scaffold", "Sex")) %>% 
+  pivot_wider(id_cols = Scaffold, names_from = Sex, values_from = c("PO.het", "sem")) %>% 
+  drop_na()
+
+scaffKeepers <- df_XY$Scaffold
+
+est <- heterozygosities %>% 
+  filter(Scaffold %in% scaffKeepers) %>% 
+  group_by(Scaffold) %>% 
+  do(tidy(t.test(.$PO.het ~ .$Sex)))
+
+df_XY <- df_XY %>% 
+  inner_join(est, by = "Scaffold") %>% 
+  mutate(Significant = ifelse(p.value < 0.001, "p-value < 0.001", ifelse(p.value >= 0.001, "p-value >= 0.001", "no")))
+
+df_XY
+```
+
+Create a scatter plot using the male proportion heterozygosity and the female heterozygosity with the standard deviations as lines on the x and y axes respectively. The data I'm presenting from a Lepidoptera where the heterogametic sex is female.
+
+```{r fig.cap = "Average heterozygosity of males and females across all scaffolds containing biallelic SNPs. Scaffolds with a significant difference (p.value < 0.001) in average heterozygosity between males and females are in red."}
+
+maxX <- max(df_XY$PO.het_M)
+maxY <- max(df_XY$PO.het_M)
+
+p_XY <- ggplot(df_XY, aes(x = PO.het_M, y = PO.het_F, color=Significant)) + 
+  geom_pointrange(aes(ymin = PO.het_F - sem_F, ymax = PO.het_F + sem_F)) +
+  geom_errorbarh(aes(xmax = PO.het_M + sem_M, xmin = PO.het_M - sem_M, height = 0)) +
+  labs(y="Heterozygosity (Female)", x = "Heterozygosity (Male)") + 
+  scale_color_manual(values = c("#C93312", "#899DA4")) +
+  xlim(0, maxX+0.05) + 
+  ylim(0, maxY+0.05) +
+  theme_bw()
+
+p_XY + theme(legend.title = element_blank()) 
+```
+
+
+
+```{r fig.cap = "This is the same graph as above with the axes switched to be cute and put the male on the Y axis and the female on the X axis if your species has an XY sexing system."}
+p_XY_switched <- ggplot(df_XY, aes(x = PO.het_F, y = PO.het_M, color=Significant)) + 
+  geom_pointrange(aes(ymin = PO.het_M - sem_M, ymax = PO.het_M + sem_M)) +
+  geom_errorbarh(aes(xmax = PO.het_F + sem_F, xmin = PO.het_F - sem_F, height = 0)) +
+  labs(y="Heterozygosity (Male)", x = "Heterozygosity (Female)") + 
+  scale_color_manual(values = c("#C93312", "#899DA4")) +
+  xlim(0, maxX+0.05) + 
+  ylim(0, maxY+0.05) +
+  theme_bw()
+
+p_XY_switched + theme(legend.title = element_blank()) 
+ggsave(file="XZ_scaffs_het.png", plot = p_XY_switched, device = "png", width = 6, height = 4, units = "in")
+```
+
+This table shows the X or Z linked scaffolds based on these analyses.
+
+```{r}
+XZ_linked <- df_XY %>% 
+  dplyr::filter(p.value <= 0.001) %>% 
+  dplyr::filter(PO.het_F < 0.05) %>% 
+  dplyr::select(Scaffold, PO.het_F, PO.het_M, sem_F, sem_M, p.value, method)
+
+XZ_linked
+```
+
+Below is a way to run a two-sample T test comparing the average read depth for each scaffold for females and males. The next two steps take a long time depending on the size of your data set and your computer. It will finish, just walk away and come back to it.
+
+```{r find_Y}
+df_depth <- data_summary(depth, varname = "Depth", groupnames = c("Locus", "Sex")) %>% 
+  pivot_wider(id_cols = Locus, names_from = Sex, values_from = c("Depth", "sem")) %>% 
+  drop_na()
+
+scaffKeepers_depth <- df_depth$Locus
+
+est_depth <- depth %>% 
+  filter(Locus %in% scaffKeepers_depth) %>% 
+  group_by(Locus) %>% 
+  do(tidy(t.test(.$Depth ~ .$Sex))) %>% 
+  dplyr::select(Locus, p.value)
+
+df_depth_filt <- df_depth %>% 
+  inner_join(est_depth, by = "Locus") %>% 
+  dplyr::select(Locus, Depth_F, Depth_M, sem_F, sem_M, p.value) %>% 
+  dplyr::filter(Depth_F < 110) %>% 
+  mutate(Ratio = Depth_F/Depth_M) %>% 
+  drop_na()
+
+df_depth_filt
+```
+
+
+```{r fig.cap = "Average locus depth of males and females across all scaffolds containing biallelic SNPs. Scaffolds are colored by their ratio of female to male locus read depth.", warning = F}
+sc <- scale_color_gradient(low = "#899DA4", high = "#C93312")
+
+p_WY_switched <- ggplot(df_depth_filt, aes(x = Depth_F, y = Depth_M, color=Ratio)) + 
+  geom_pointrange(aes(ymin = Depth_M - sem_M, ymax = Depth_M + sem_M)) +
+  geom_errorbarh(aes(xmax = Depth_F + sem_F, xmin = Depth_F - sem_F, height = 0)) +
+  labs(y="Depth (Male)", x = "Depth (Female)") + 
+  sc + 
+  xlim(0,100) + 
+  ylim(0,100) +
+  theme(aspect.ratio=1) +
+  theme_bw()
+
+p_WY_switched
+
+ggsave(filename = "WY_scaffs_depth.png", plot = p_WY_switched, device = "png", width = 6, height = 4, units = "in")
+```
+
+This table shows the W or Y linked scaffolds based on these analyses.
+
+```{r}
+YW_linked <- df_depth_filt %>% 
+  filter(Depth_M < 2) %>% 
+  filter(Ratio > 20)
+
+YW_linked
+```
+
